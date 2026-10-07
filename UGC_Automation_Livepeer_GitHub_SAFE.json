@@ -1,0 +1,564 @@
+{
+  "name": "UGC Automation Livepeer Direct Video Output v16.4",
+  "nodes": [
+    {
+      "parameters": {
+        "updates": [
+          "message",
+          "callback_query"
+        ],
+        "additionalFields": {}
+      },
+      "id": "146f8b51-3578-4ae1-a5df-4ab78c3190ae",
+      "name": "Telegram Trigger",
+      "type": "n8n-nodes-base.telegramTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        -3472,
+        -400
+      ],
+      "webhookId": "cf555043-346b-4444-a504-5756488db8ad"
+    },
+    {
+      "parameters": {
+        "jsCode": "const body = $input.item.json || {};\nconst msg = body.message || (body.message_id || body.text || body.caption || body.photo ? body : null);\nif (!msg) return [{ json: { routeTo: 'help', chatId: null, message: '👋 Send /generate Product Name | Description with a product photo.' } }];\n\nconst chatId = msg.chat?.id?.toString();\nconst text = msg.text || msg.caption || '';\nconst photo = msg.photo || null;\nconst username = msg.from?.username || msg.from?.first_name || body.username || 'Client';\nif (!chatId) return [{ json: { routeTo: 'help', chatId: null, message: '❌ Could not determine your chat. Please try again.' } }];\n\nconst staticData = $getWorkflowStaticData('global');\nif (!staticData.sessions) staticData.sessions = {};\n\nif (text && text.trim().toLowerCase() === '/reset') {\n  delete staticData.sessions[chatId];\n  return [{ json: { routeTo: 'help', chatId, message: '✅ Session reset.\\n\\nYou can now send /generate again.' } }];\n}\n\nconst existing = staticData.sessions[chatId];\nconst THIRTY_MIN = 30 * 60 * 1000;\nif (existing && Date.now() - new Date(existing.storedAt || 0).getTime() > THIRTY_MIN) delete staticData.sessions[chatId];\n\nconst session = staticData.sessions[chatId];\nif (session?.locked) {\n  const lockStartedAt = session.lockedAt || session.storedAt || new Date().toISOString();\n  const lockAge = Date.now() - new Date(lockStartedAt).getTime();\n  const remaining = Math.max(1, Math.ceil((THIRTY_MIN - lockAge) / 60000));\n  const job = session.livepeerJob;\n  const validJobId = typeof job?.jobId === 'string' && /^mjob_[A-Za-z0-9_-]+$/.test(job.jobId);\n  if (validJobId && Date.now() - new Date(job.submittedAt || session.storedAt || 0).getTime() < 60 * 60 * 1000) {\n    return [{ json: { routeTo:'resume_livepeer', chatId, username:session.username, productName:session.productName,\n      productDescription:session.productDescription, imageUrl:session.imageUrl, script:session.script || '',\n      livepeerJobId:job.jobId, pollCount:0, videoStatus:'queued', resuming:true } }];\n  }\n  // A stale/invalid job ID can happen after a failed test or workflow import.\n  // Do not send it to Livepeer's strict get_create_media validator; clear the\n  // stale lock and let the current /generate request start a fresh render.\n  if (session?.locked && job?.jobId && !validJobId && text && text.trim().toLowerCase().startsWith('/generate')) {\n    staticData.sessions[chatId] = { ...session, locked:false, livepeerJob:null };\n  } else {\n    return [{ json: { routeTo:'locked', chatId, message:`⏳ Already generating \"${session.productName}\".\\n\\nWait ~${remaining} min or send /reset` } }];\n  }\n}\n\nif (!text || !text.toLowerCase().startsWith('/generate')) {\n  return [{ json: { routeTo:'help', chatId, message:`👋 Welcome ${username}!\\n\\nUse:\\n/generate Product Name | Description\\n\\n📸 Attach your product photo to the same message.\\n\\nExample:\\n/generate Nivea Cream | Winter skincare cream` } }];\n}\nif (!photo || !photo.length) return [{ json: { routeTo:'help', chatId, message:'❌ Missing Photo!\\n\\nAttach your product photo with the /generate command.' } }];\nconst photoFileId = photo[photo.length-1].file_id;\nconst cleaned=text.replace(/^\\/generate\\s*/i,'').trim();\nconst parts=cleaned.split('|');\nconst productName=(parts[0]||'').trim();\nconst productDescription=(parts[1]||'').trim() || `A premium product called ${productName}`;\nif (!productName) return [{ json:{ routeTo:'help', chatId, message:'❌ Missing Product Name!\\n\\nFormat:\\n/generate Product Name | Description' } }];\nreturn [{ json:{ routeTo:'parse_success', chatId, username, productName, productDescription, photoFileId } }];"
+      },
+      "id": "7f0c7fa2-4b04-4cb3-a3e5-3c5f7991f016",
+      "name": "Parse Message",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -3248,
+        -400
+      ],
+      "notes": "Parses /generate messages, validates an attached product photo, manages the 30-minute session lock, and supports resuming a saved Livepeer job."
+    },
+    {
+      "parameters": {
+        "resource": "file",
+        "fileId": "={{$json.photoFileId}}",
+        "additionalFields": {}
+      },
+      "id": "cd3987c9-94cd-4a94-a464-ed1f29f6e4fa",
+      "name": "Get Telegram File Info",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        -2800,
+        -16
+      ],
+      "webhookId": "5e04eb79-98ae-4ab1-b1b0-b595a95dc5ee",
+      "notes": "Downloads the Telegram photo into n8n binary data so Livepeer can ingest it without needing a Telegram bot-token URL."
+    },
+    {
+      "parameters": {
+        "jsCode": "const input=$input.item;\nconst binary=input.binary||{};\nconst prop=Object.keys(binary)[0];\nif(!prop) throw new Error('Telegram photo was not downloaded as binary data.');\nconst buffer=await this.helpers.getBinaryDataBuffer(0, prop);\nconst mimeType=binary[prop].mimeType||'image/jpeg';\nconst base=$('Parse Message').item.json;\nif(buffer.length>3*1024*1024) throw new Error('Image is larger than Livepeer MCP upload limit (~3 MB).');\nreturn [{json:{...base,livepeerUploadData:buffer.toString('base64'),livepeerMimeType:mimeType}}];"
+      },
+      "id": "1b023621-1f0f-46b9-8d4e-2618506bbb55",
+      "name": "Prepare Livepeer Image Upload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -2576,
+        -16
+      ],
+      "notes": "Converts the downloaded Telegram image to base64 for the Livepeer MCP upload tool. No Telegram bot token is embedded in the image URL."
+    },
+    {
+      "parameters": {
+        "endpointUrl": "https://agent.livepeer.org/api/mcp/creative",
+        "tool": {
+          "__rl": true,
+          "mode": "id",
+          "value": "upload"
+        },
+        "inputMode": "json",
+        "jsonInput": "={{ JSON.stringify({ data: $json.livepeerUploadData, mime_type: $json.livepeerMimeType }) }}",
+        "options": {
+          "convertToBinary": true,
+          "timeout": 120000
+        }
+      },
+      "id": "8fa91667-d5ff-4ffc-b1ed-9189fbd464b1",
+      "name": "Livepeer Agent — Upload Image",
+      "type": "@n8n/n8n-nodes-langchain.mcpClient",
+      "typeVersion": 1.1,
+      "position": [
+        -2352,
+        -16
+      ],
+      "notes": "Uploads the Telegram image to Livepeer MCP and returns an accessible handoff URL for image-to-video generation."
+    },
+    {
+      "parameters": {
+        "jsCode": "const r=$input.item.json||{};\nconst base=$('Prepare Livepeer Image Upload').item.json;\nfunction walk(v,k=''){\n  if(v==null)return[];\n  if(typeof v==='string')return[{k,v}];\n  if(Array.isArray(v))return v.flatMap(x=>walk(x,k));\n  if(typeof v==='object')return Object.entries(v).flatMap(([a,b])=>walk(b,a));\n  return[];\n}\nconst fields=walk(r);\nconst preferred=fields.find(x=>/^(url|file_url|fileUrl|upload_url|uploadUrl|asset_url|assetUrl|source_url|sourceUrl|public_url|publicUrl)$/i.test(x.k)&&/^https?:\\/\\//i.test(String(x.v)));\nconst anyHttp=fields.find(x=>/^https?:\\/\\//i.test(String(x.v)) && !String(x.v).includes('agent.livepeer.org/get-started') && !String(x.v).includes('docs.the'));\nconst imageUrl=preferred?.v||anyHttp?.v;\nif(!imageUrl) throw new Error('Livepeer upload did not return an accessible https URL. Upload response: '+JSON.stringify(r).slice(0,2500));\nreturn [{json:{...base,imageUrl:String(imageUrl)}}];"
+      },
+      "id": "79b585c1-724b-46da-a83f-2b1047e84a67",
+      "name": "Extract Livepeer Upload URL",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -2128,
+        -16
+      ],
+      "notes": "Extracts the public HTTPS URL returned by the Livepeer upload tool and carries the original Telegram/session fields forward."
+    },
+    {
+      "parameters": {
+        "jsCode": "const staticData = $getWorkflowStaticData('global');\nif (!staticData.sessions) staticData.sessions = {};\nconst data = $input.item.json;\nconst cutoff = Date.now() - 30 * 60 * 1000;\nfor (const [id, s] of Object.entries(staticData.sessions)) {\n  if (new Date(s.storedAt || 0).getTime() < cutoff) delete staticData.sessions[id];\n}\nconst now = new Date().toISOString();\nstaticData.sessions[data.chatId] = {\n  chatId:data.chatId, username:data.username, productName:data.productName,\n  productDescription:data.productDescription, imageUrl:data.imageUrl,\n  storedAt:now, locked:true, lockedAt:now\n};\nreturn [{ json:data }];"
+      },
+      "id": "9e70aa2e-aa62-47ed-9c76-c34db9143787",
+      "name": "Store Session",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1904,
+        -16
+      ],
+      "notes": "Stores the session using the Livepeer-hosted image URL, avoiding Telegram file URLs."
+    },
+    {
+      "parameters": {
+        "chatId": "={{$json.chatId}}",
+        "text": "=⏳ *Generating video for {{$json.productName}}*...\n\nI'm creating a product-focused video with Livepeer Agent and will send it here when ready 🎬",
+        "additionalFields": {
+          "parse_mode": "Markdown"
+        }
+      },
+      "id": "86824a4c-35aa-4dab-b5ba-002e3804edd4",
+      "name": "Send Processing Message",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        -1680,
+        -16
+      ],
+      "webhookId": "c18eda1d-ab98-48fe-8a69-357ea5be78a0"
+    },
+    {
+      "parameters": {
+        "modelId": {
+          "__rl": true,
+          "value": "claude-sonnet-4-6",
+          "mode": "list",
+          "cachedResultName": "Claude Sonnet 4.6"
+        },
+        "messages": {
+          "values": [
+            {
+              "content": "=You are a professional UGC ad script writer.\n\nProduct Name:\n{{ $('Parse Message').item.json.productName }}\n\nDescription:\n{{ $('Parse Message').item.json.productDescription }}\n\nWrite a concise 15-second product-focused UGC script that can also be used as visual direction for an image-to-video generator.\n\nRequirements:\n- Strong hook in first 3 seconds\n- Natural human speech\n- Conversational tone\n- Product focused\n- Clear visual actions that can be represented from the supplied product image\n- End with a call to action\n\nReturn only the script."
+            }
+          ]
+        },
+        "options": {
+          "maxTokens": 512,
+          "temperature": 0.7
+        }
+      },
+      "id": "b2bba11b-2877-4eac-9f23-525a2d6ee2c6",
+      "name": "Generate Script",
+      "type": "@n8n/n8n-nodes-langchain.anthropic",
+      "typeVersion": 1,
+      "position": [
+        -1456,
+        -16
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const scriptNode=$input.item.json;\nconst script=scriptNode.content?.filter?.(p=>p.type==='text').map(p=>p.text).join('\\n') || scriptNode.message?.content || scriptNode.choices?.[0]?.message?.content || scriptNode.text || '';\nif (!script || script.trim().length<10) throw new Error('Claude returned empty script.');\nconst base=$('Parse Message').item.json;\nreturn [{json:{chatId:base.chatId, productName:base.productName, productDescription:base.productDescription,\n  imageUrl:$('Extract Livepeer Upload URL').item.json.imageUrl, username:base.username, script:script.trim()}}];"
+      },
+      "id": "fd990fbf-5fca-4bb6-a348-6e6934dda842",
+      "name": "Extract Script",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1104,
+        -16
+      ],
+      "notes": "Extracts the script and uses the Livepeer-uploaded image URL."
+    },
+    {
+      "parameters": {
+        "chatId": "={{$json.chatId}}",
+        "text": "={{$json.message || $json.error?.message || 'Something went wrong. Try: /generate Product | Description with a photo attached.'}}",
+        "additionalFields": {}
+      },
+      "id": "952c365d-01c1-49e7-ab23-d2073a926055",
+      "name": "Send Parse Error",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        -2576,
+        -208
+      ],
+      "webhookId": "0094f280-0f0b-465b-ad4c-520958f25485"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 1
+          },
+          "conditions": [
+            {
+              "id": "0e35e177-0ece-4ebf-80c0-37daa4f16404",
+              "leftValue": "={{$json.routeTo}}",
+              "rightValue": "parse_success",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "63c54840-39f6-4470-b5a0-67f72ecbe988",
+      "name": "New Generate Request?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        -3024,
+        -400
+      ]
+    },
+    {
+      "parameters": {
+        "endpointUrl": "https://agent.livepeer.org/api/mcp/raw",
+        "tool": {
+          "__rl": true,
+          "mode": "id",
+          "value": "run_capability"
+        },
+        "inputMode": "json",
+        "jsonInput": "={{ JSON.stringify({\n  capability: \"ltx-25-i2v-fast\",\n  prompt: \"Create a short product-focused UGC-style promotional video from the supplied product image. Use this script as creative direction:\\n\" + $json.script,\n  source_url: $json.imageUrl,\n  params: { duration: 6 }\n}) }}",
+        "options": {
+          "convertToBinary": true,
+          "timeout": 120000
+        }
+      },
+      "id": "c7db5af4-b11b-4709-85f8-79edb459f9d3",
+      "name": "Livepeer Agent — Run Capability",
+      "type": "@n8n/n8n-nodes-langchain.mcpClient",
+      "typeVersion": 1.1,
+      "position": [
+        -880,
+        -16
+      ],
+      "notes": "Runs the selected Livepeer capability on the raw MCP surface. In the validated ltx-25-i2v-fast execution, the tool returned a completed video URL directly, so no mjob_/job polling is used."
+    },
+    {
+      "parameters": {
+        "url": "={{$json.videoUrl}}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "file"
+            }
+          }
+        }
+      },
+      "id": "625bdd1f-292c-4ae4-b24b-2a062d689d2e",
+      "name": "Download Livepeer MP4",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -1680,
+        -880
+      ],
+      "retryOnFail": true,
+      "notes": "Downloads the generated Livepeer MP4 into binary property data for Telegram."
+    },
+    {
+      "parameters": {
+        "operation": "sendVideo",
+        "chatId": "={{$json.chatId}}",
+        "binaryData": true,
+        "additionalFields": {
+          "caption": "=🎬 *Video ready!*\\n\\n*{{$json.productName}}*\\n\\n✅ AI Generated\\n🚀 Ready to post",
+          "parse_mode": "Markdown"
+        }
+      },
+      "id": "f1600a86-c076-4cda-becc-223ec2a59796",
+      "name": "Send Livepeer Video",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        -1392,
+        -880
+      ],
+      "retryOnFail": false,
+      "webhookId": "373a7214-089d-472e-9b97-4d6eeb24f3f7",
+      "notes": "Sends the generated Livepeer MP4 to Telegram."
+    },
+    {
+      "parameters": {
+        "jsCode": "const staticData=$getWorkflowStaticData('global');\nconst {chatId}=$input.item.json||{};\nif(chatId&&staticData.sessions?.[chatId])delete staticData.sessions[chatId];\nif(staticData.livepeerPolls&&$execution.id)delete staticData.livepeerPolls[$execution.id];\nreturn $input.item;"
+      },
+      "id": "66d5ee7d-d7ab-400a-bafc-46d76b92f9cc",
+      "name": "Unlock After Livepeer",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1104,
+        -784
+      ]
+    },
+    {
+      "parameters": {
+        "chatId": "={{$json.chatId}}",
+        "text": "={{$json.message || ('❌ Livepeer could not generate video for *' + $json.productName + '*. Please try /generate again.')}}",
+        "additionalFields": {
+          "parse_mode": "Markdown"
+        }
+      },
+      "id": "a8bcf9b3-af3a-4471-b333-7b62c95d25cb",
+      "name": "Livepeer Error Msg",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        -1392,
+        -416
+      ],
+      "webhookId": "7b9dab30-5cc9-471b-bdb0-1c70d8db93df"
+    },
+    {
+      "parameters": {
+        "content": "PUBLIC GITHUB SETUP NOTES\n\nThis workflow requires credentials to be configured in your own n8n instance.\n\nRequired services:\n1. Telegram Bot API credential\n2. Anthropic API credential for the script-generation step\n3. Livepeer Agent MCP authentication for the Livepeer MCP nodes\n\nConfigure your own credentials after importing this workflow. No API keys or bot tokens are hardcoded in this public workflow.\n\nThe workflow uploads the Telegram image through Livepeer MCP, generates the video with the selected Livepeer capability, downloads the resulting MP4, and sends it back to Telegram.",
+        "height": 330,
+        "width": 430,
+        "color": 5
+      },
+      "id": "d30d0f7a-a99b-4fe0-9cf2-80db7663ed26",
+      "name": "Setup Notes",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -3296,
+        224
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const r = $input.item.json ?? {};\nconst base = $('Extract Script').item.json;\n\nfunction walk(v) {\n  if (v == null) return [];\n  if (typeof v === 'string') return [v];\n  if (Array.isArray(v)) return v.flatMap(walk);\n  if (typeof v === 'object') return Object.values(v).flatMap(walk);\n  return [];\n}\n\nconst structured = r.structuredContent ?? {};\nconst directCandidates = [\n  structured.url,\n  r.url,\n  r.output?.url,\n  r.result?.url,\n];\n\nlet videoUrl = directCandidates.find(v =>\n  typeof v === 'string' &&\n  /^https?:\\/\\//i.test(v) &&\n  /\\.mp4(?:\\?.*)?$/i.test(v)\n);\n\nif (!videoUrl) {\n  videoUrl = walk(r).find(v =>\n    /^https?:\\/\\//i.test(v) &&\n    /\\.mp4(?:\\?.*)?$/i.test(v)\n  );\n}\n\nif (!videoUrl) {\n  throw new Error(\n    'Livepeer run_capability returned no MP4 URL. Raw response: ' +\n    JSON.stringify(r).slice(0, 5000)\n  );\n}\n\nconst cost = structured['cost_usd_estimated'] ?? structured['costUsdEstimated'] ?? null;\nconst units = structured['cost_units'] ?? structured['costUnits'] ?? null;\nconst capability = structured.capability ?? structured.requested_capability ?? null;\n\nreturn [{\n  json: {\n    chatId: base.chatId,\n    productName: base.productName,\n    productDescription: base.productDescription,\n    username: base.username,\n    script: base.script,\n    imageUrl: base.imageUrl,\n    videoUrl,\n    videoStatus: 'completed',\n    livepeerCapability: capability,\n    livepeerEstimatedCostUsd: cost,\n    livepeerCostUnits: units,\n    livepeerRunResponse: r\n  }\n}];"
+      },
+      "id": "4f0d5f7b-5d75-4f12-b2d0-7e6f0c2a3b11",
+      "name": "Extract Livepeer Video URL",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -656,
+        -16
+      ],
+      "notes": "Extracts the final MP4 URL from structuredContent.url returned directly by run_capability. No job polling."
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Telegram Trigger": {
+      "main": [
+        [
+          {
+            "node": "Parse Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Message": {
+      "main": [
+        [
+          {
+            "node": "New Generate Request?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "New Generate Request?": {
+      "main": [
+        [
+          {
+            "node": "Get Telegram File Info",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Send Parse Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Store Session": {
+      "main": [
+        [
+          {
+            "node": "Send Processing Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Processing Message": {
+      "main": [
+        [
+          {
+            "node": "Generate Script",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Generate Script": {
+      "main": [
+        [
+          {
+            "node": "Extract Script",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Script": {
+      "main": [
+        [
+          {
+            "node": "Livepeer Agent — Run Capability",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Download Livepeer MP4": {
+      "main": [
+        [
+          {
+            "node": "Send Livepeer Video",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Livepeer Video": {
+      "main": [
+        [
+          {
+            "node": "Unlock After Livepeer",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Livepeer Error Msg": {
+      "main": [
+        [
+          {
+            "node": "Unlock After Livepeer",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Telegram File Info": {
+      "main": [
+        [
+          {
+            "node": "Prepare Livepeer Image Upload",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Livepeer Image Upload": {
+      "main": [
+        [
+          {
+            "node": "Livepeer Agent — Upload Image",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Livepeer Agent — Upload Image": {
+      "main": [
+        [
+          {
+            "node": "Extract Livepeer Upload URL",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Livepeer Upload URL": {
+      "main": [
+        [
+          {
+            "node": "Store Session",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Livepeer Agent — Run Capability": {
+      "main": [
+        [
+          {
+            "node": "Extract Livepeer Video URL",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Livepeer Video URL": {
+      "main": [
+        [
+          {
+            "node": "Download Livepeer MP4",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "nodeGroups": [],
+  "tags": [
+    {
+      "updatedAt": "2026-04-11T12:39:09.859Z",
+      "createdAt": "2026-04-11T12:39:09.859Z",
+      "id": "fneb20sEmlvMMBrf",
+      "name": "UGC Automation"
+    }
+  ]
+}
